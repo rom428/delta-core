@@ -3484,11 +3484,12 @@ checksum = "9106e1d747ffd48e6be5bb2d97fa706ed25b144fbee4d5c02eae110cd8d6badd"
 
 [[package]]
 name = "mail-builder"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8bca634885db8e836b80700a73661de20ffd93cb5787729afc31575545e2aed"
+checksum = "aca3ad941e4c466402151719d6b4cea4bdfcb212b11e5970afa75e7d28c6502a"
 dependencies = [
  "encodify",
+ "web-time",
 ]
 
 [[package]]
