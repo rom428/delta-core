@@ -556,7 +556,7 @@ dependencies = [
  "bolero-kani",
  "bolero-libfuzzer",
  "cfg-if",
- "rand 0.9.4",
+ "rand 0.9.5",
 ]
 
 [[package]]
@@ -579,7 +579,7 @@ dependencies = [
  "bolero-generator",
  "lazy_static",
  "pretty-hex",
- "rand 0.9.4",
+ "rand 0.9.5",
  "rand_xoshiro",
 ]
 
@@ -1387,8 +1387,8 @@ dependencies = [
  "proptest",
  "qrcodegen",
  "quick-xml",
+ "rand 0.10.2",
  "rand 0.8.6",
- "rand 0.9.4",
  "ratelimit",
  "regex",
  "rusqlite",
@@ -1522,7 +1522,7 @@ dependencies = [
  "human-panic",
  "libc",
  "num-traits",
- "rand 0.9.4",
+ "rand 0.10.2",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
@@ -2500,7 +2500,7 @@ dependencies = [
  "idna",
  "ipnet",
  "once_cell",
- "rand 0.9.4",
+ "rand 0.9.5",
  "ring",
  "thiserror 2.0.21",
  "tinyvec",
@@ -2522,7 +2522,7 @@ dependencies = [
  "moka",
  "once_cell",
  "parking_lot",
- "rand 0.9.4",
+ "rand 0.9.5",
  "resolv-conf",
  "smallvec",
  "thiserror 2.0.21",
@@ -2942,7 +2942,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "log",
- "rand 0.9.4",
+ "rand 0.9.5",
  "tokio",
  "url",
  "xmltree",
@@ -4757,7 +4757,7 @@ checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
 dependencies = [
  "bitflags 2.11.0",
  "num-traits",
- "rand 0.9.4",
+ "rand 0.9.5",
  "rand_chacha 0.9.0",
  "rand_xorshift",
  "regex-syntax",
@@ -4930,9 +4930,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.4"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
+checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.3",
@@ -5750,7 +5750,7 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "pin-project",
- "rand 0.9.4",
+ "rand 0.9.5",
  "sendfd",
  "serde",
  "serde_json",
@@ -5780,7 +5780,7 @@ dependencies = [
  "chacha20poly1305",
  "hkdf",
  "md-5",
- "rand 0.9.4",
+ "rand 0.9.5",
  "ring-compat",
  "sha1",
 ]
@@ -6069,7 +6069,7 @@ dependencies = [
  "precis-core",
  "precis-profiles",
  "quoted-string-parser",
- "rand 0.9.4",
+ "rand 0.9.5",
 ]
 
 [[package]]
@@ -6476,7 +6476,7 @@ dependencies = [
  "getrandom 0.3.3",
  "http 1.1.0",
  "httparse",
- "rand 0.9.4",
+ "rand 0.9.5",
  "ring",
  "rustls-pki-types",
  "simdutf8",
