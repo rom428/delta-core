@@ -3043,6 +3043,17 @@ async fn apply_group_changes(
     let is_from_in_chat =
         !chat_contacts.contains(&ContactId::SELF) || chat_contacts.contains(&from_id);
 
+    if is_from_in_chat {
+        send_event_chat_modified |=
+            apply_group_roles(context, mime_parser, chat.id, from_id).await?;
+    }
+    let managed = chat::is_managed_group(context, chat.id).await?;
+    // In managed groups only the owner may rewrite the member list implicitly
+    // (via To/Past-Members headers or member timestamps).
+    // Moderators and members can only apply explicit, authorized additions and removals.
+    let implicit_changes_allowed = !managed
+        || chat::get_group_role(context, chat.id, from_id).await? == chat::GroupRole::Owner;
+
     if let Some(removed_addr) = mime_parser.get_header(HeaderDef::ChatGroupMemberRemoved) {
         if !is_from_in_chat {
             better_msg = Some(String::new());
@@ -3096,6 +3107,24 @@ async fn apply_group_changes(
         }
     }
 
+    // Reject unauthorized changes in managed groups.
+    if managed {
+        if let Some(id) = removed_id {
+            if !chat::may_change_membership(context, chat.id, from_id, id, false).await? {
+                warn!(context, "Ignoring unauthorized removal of {id} by {from_id}.");
+                removed_id = None;
+                better_msg = Some(String::new());
+            }
+        }
+        if let Some(id) = added_id {
+            if !chat::may_change_membership(context, chat.id, from_id, id, true).await? {
+                warn!(context, "Ignoring unauthorized addition of {id} by {from_id}.");
+                added_id = None;
+                better_msg = Some(String::new());
+            }
+        }
+    }
+
     apply_chat_name_avatar_and_description_changes(
         context,
         mime_parser,
@@ -3109,7 +3138,8 @@ async fn apply_group_changes(
 
     if is_from_in_chat {
         // Avoid insertion of `from_id` into a group with inappropriate encryption state.
-        if from_is_key_contact != chat.grpid.is_empty()
+        if implicit_changes_allowed
+            && from_is_key_contact != chat.grpid.is_empty()
             && chat.member_list_is_stale(context).await?
         {
             info!(context, "Member list is stale.");
@@ -3145,8 +3175,9 @@ async fn apply_group_changes(
                 })
                 .await?;
             send_event_chat_modified = true;
-        } else if let Some(ref chat_group_member_timestamps) =
-            mime_parser.chat_group_member_timestamps()
+        } else if let Some(ref chat_group_member_timestamps) = mime_parser
+            .chat_group_member_timestamps()
+            .filter(|_| implicit_changes_allowed)
         {
             send_event_chat_modified |= update_chats_contacts_timestamps(
                 context,
@@ -3162,7 +3193,17 @@ async fn apply_group_changes(
             let self_added = if let Some(added_addr) =
                 mime_parser.get_header(HeaderDef::ChatGroupMemberAdded)
             {
-                context.is_self_addr(added_addr).await? && !chat_contacts.contains(&ContactId::SELF)
+                context.is_self_addr(added_addr).await?
+                    && !chat_contacts.contains(&ContactId::SELF)
+                    && (!managed
+                        || chat::may_change_membership(
+                            context,
+                            chat.id,
+                            from_id,
+                            ContactId::SELF,
+                            true,
+                        )
+                        .await?)
             } else {
                 false
             };
@@ -3177,7 +3218,8 @@ async fn apply_group_changes(
             }
 
             // Allow non-Delta Chat MUAs to add members.
-            if mime_parser.get_header(HeaderDef::ChatVersion).is_none() {
+            if implicit_changes_allowed && mime_parser.get_header(HeaderDef::ChatVersion).is_none()
+            {
                 // Don't delete any members locally, but instead add absent ones to provide group
                 // membership consistency for all members:
                 new_members.extend(to_ids_flat.iter());
@@ -3218,6 +3260,12 @@ async fn apply_group_changes(
             .await?;
     }
 
+    // Second pass: members added above may now carry roles (e.g. when we were just added).
+    if is_from_in_chat {
+        send_event_chat_modified |=
+            apply_group_roles(context, mime_parser, chat.id, from_id).await?;
+    }
+
     let new_chat_contacts = BTreeSet::<ContactId>::from_iter(
         chat::get_chat_contacts(context, chat.id)
             .await?
@@ -3239,6 +3287,19 @@ async fn apply_group_changes(
     } else {
         false
     };
+
+    // A moderator added a member to a group with moderators. The new member only learns the owner
+    // from the moderator's message, not the moderators, so as the owner we send a notice
+    // that carries the full roles. Only the owner's header may set moderators.
+    if let Some(added_id) = added_id
+        && !id_was_already_added
+        && added_id != ContactId::SELF
+        && from_id != ContactId::SELF
+        && chat::get_group_role(context, chat.id, ContactId::SELF).await? == chat::GroupRole::Owner
+        && chat::has_group_moderators(context, chat.id).await?
+    {
+        chat::send_group_roles_notice(context, chat.id).await?;
+    }
     if let Some(removed_id) = removed_id {
         removed_ids.remove(&removed_id);
     }
@@ -4168,6 +4229,131 @@ async fn lookup_key_contact_by_address(
         }
     };
     Ok(contact_id)
+}
+
+/// Applies the `Chat-Group-Roles` header.
+///
+/// If the group is already managed locally, only a header sent by the owner is accepted.
+///
+/// If it is not (yet) managed locally, e.g. because we have just been added, the owner announced
+/// in the header is accepted from any sender who is in the group, provided that the group ID
+/// commits to the announced owner (see `chat::create_managed_grpid()`) and the owner is a member
+/// of the group. We cannot require the sender to be the owner: a member added later may receive
+/// a message from a moderator or from a regular member before one from the owner. Since the
+/// group ID is bound to the owner's fingerprint, nobody else can claim ownership.
+///
+/// Returns true if any role changed, so that the caller can emit `ChatModified`.
+async fn apply_group_roles(
+    context: &Context,
+    mime_parser: &MimeMessage,
+    chat_id: ChatId,
+    from_id: ContactId,
+) -> Result<bool> {
+    let Some(header) = mime_parser.get_header(HeaderDef::ChatGroupRoles) else {
+        return Ok(false);
+    };
+    if from_id.is_special() {
+        return Ok(false);
+    }
+    let mut entries: Vec<(String, chat::GroupRole)> = Vec::new();
+    for item in header.split_ascii_whitespace() {
+        let Some((fpr, role)) = item.split_once(':') else {
+            continue;
+        };
+        let role = match role {
+            "1" => chat::GroupRole::Moderator,
+            "2" => chat::GroupRole::Owner,
+            _ => continue,
+        };
+        entries.push((fpr.to_string(), role));
+    }
+
+    let sender_role = chat::get_group_role(context, chat_id, from_id).await?;
+    let managed = chat::is_managed_group(context, chat_id).await?;
+    let self_fpr = chat::contact_fingerprint_hex(context, ContactId::SELF).await?;
+
+    // Owner that we learn from this header, only if the group is not managed locally yet.
+    let mut announced_owner = None;
+    if !managed {
+        let grpid: String = context
+            .sql
+            .query_get_value("SELECT grpid FROM chats WHERE id=?", (chat_id,))
+            .await?
+            .unwrap_or_default();
+        for (fpr, role) in &entries {
+            if *role != chat::GroupRole::Owner || !chat::grpid_commits_to_owner(&grpid, fpr) {
+                continue;
+            }
+            let id = if Some(fpr) == self_fpr.as_ref() {
+                Some(ContactId::SELF)
+            } else {
+                lookup_key_contact_by_fingerprint(context, fpr).await?
+            };
+            if let Some(id) = id
+                && chat::is_contact_in_chat(context, chat_id, id).await?
+            {
+                announced_owner = Some(id);
+                break;
+            }
+        }
+    }
+    if sender_role != chat::GroupRole::Owner && announced_owner.is_none() {
+        info!(
+            context,
+            "Ignoring Chat-Group-Roles from {from_id} in {chat_id}: \
+             sender is not the owner and no verified owner can be learned from it \
+             (managed: {managed})."
+        );
+        return Ok(false);
+    }
+
+    let mut changed = false;
+    let mut moderators = BTreeSet::new();
+    for (fpr, role) in &entries {
+        let id = if Some(fpr) == self_fpr.as_ref() {
+            Some(ContactId::SELF)
+        } else {
+            lookup_key_contact_by_fingerprint(context, fpr).await?
+        };
+        let Some(id) = id else { continue };
+        match role {
+            chat::GroupRole::Owner if Some(id) == announced_owner => {
+                info!(
+                    context,
+                    "Learned owner {id} of group {chat_id} from message of {from_id}."
+                );
+                chat::set_group_role_in_db(context, chat_id, id, chat::GroupRole::Owner).await?;
+                changed = true;
+            }
+            chat::GroupRole::Moderator => {
+                moderators.insert(id);
+            }
+            _ => {}
+        }
+    }
+    // The owner is the single writer of the moderator set.
+    // A header relayed by someone else may only teach us who the owner is;
+    // moderators are applied once we receive a message from the owner.
+    if sender_role != chat::GroupRole::Owner && announced_owner != Some(from_id) {
+        return Ok(changed);
+    }
+    // Demote everyone who is not listed.
+    for id in chat::get_chat_contacts(context, chat_id).await? {
+        let old_role = chat::get_group_role(context, chat_id, id).await?;
+        if old_role == chat::GroupRole::Owner {
+            continue;
+        }
+        let role = if moderators.contains(&id) {
+            chat::GroupRole::Moderator
+        } else {
+            chat::GroupRole::Member
+        };
+        if role != old_role {
+            chat::set_group_role_in_db(context, chat_id, id, role).await?;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 async fn lookup_key_contact_by_fingerprint(

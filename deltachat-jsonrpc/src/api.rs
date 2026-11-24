@@ -47,7 +47,7 @@ pub mod types;
 use num_traits::FromPrimitive;
 use types::account::Account;
 use types::calls::JsonrpcCallInfo;
-use types::chat::FullChat;
+use types::chat::{FullChat, JsonrpcGroupRoles};
 use types::contact::{ContactObject, VcardContact};
 use types::events::Event;
 use types::http::HttpResponse;
@@ -1057,6 +1057,52 @@ impl CommandApi {
     ) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
         chat::create_group(&ctx, &name).await.map(|id| id.to_u32())
+    }
+
+    /// Create a new managed encrypted group chat.
+    ///
+    /// Same as [`Self::create_group_chat`], but the creator becomes the group's owner.
+    /// Only the owner and moderators can add members;
+    /// only the owner can appoint and dismiss moderators.
+    /// Members of a managed group using core versions
+    /// without role support do not enforce these rules.
+    async fn create_managed_group(&self, account_id: u32, name: String) -> Result<u32> {
+        let ctx = self.get_context(account_id).await?;
+        chat::create_managed_group(&ctx, &name)
+            .await
+            .map(|id| id.to_u32())
+    }
+
+    /// Appoints (`is_moderator == true`) or dismisses a moderator of a managed group.
+    ///
+    /// Fails unless the current user is the group owner
+    /// and `contact_id` is a member of the group.
+    async fn set_group_moderator(
+        &self,
+        account_id: u32,
+        chat_id: u32,
+        contact_id: u32,
+        is_moderator: bool,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        chat::set_group_moderator(
+            &ctx,
+            ChatId::new(chat_id),
+            ContactId::new(contact_id),
+            is_moderator,
+        )
+        .await
+    }
+
+    /// Returns the roles of the group members
+    /// and what the current user is allowed to do.
+    ///
+    /// Use this to show owner/moderator badges
+    /// and to hide controls the user may not use.
+    /// The core enforces the rules regardless.
+    async fn get_group_roles(&self, account_id: u32, chat_id: u32) -> Result<JsonrpcGroupRoles> {
+        let ctx = self.get_context(account_id).await?;
+        JsonrpcGroupRoles::try_from_dc_chat_id(&ctx, chat_id).await
     }
 
     /// Create a new unencrypted group chat.

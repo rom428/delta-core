@@ -2713,6 +2713,16 @@ CREATE TABLE smtp_failure (
         .await?;
     }
 
+    inc_and_check(&mut migration_version, 171)?;
+    if dbversion < migration_version {
+        // Role of a contact in a managed group: 0 = member, 1 = moderator, 2 = owner.
+        sql.execute_migration(
+            "ALTER TABLE chats_contacts ADD COLUMN role INTEGER NOT NULL DEFAULT 0",
+            migration_version,
+        )
+        .await?;
+    }
+
     let new_version = sql
         .get_raw_config_int(VERSION_CFG)
         .await?

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
@@ -292,5 +293,79 @@ impl From<JsonrpcChatType> for Chattype {
             JsonrpcChatType::OutBroadcast => Chattype::OutBroadcast,
             JsonrpcChatType::InBroadcast => Chattype::InBroadcast,
         }
+    }
+}
+
+/// Role of a member in a managed group.
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TypeDef, schemars::JsonSchema)]
+#[serde(rename = "GroupRole")]
+pub enum JsonrpcGroupRole {
+    /// Regular member.
+    Member,
+    /// May add members and remove regular members.
+    Moderator,
+    /// Created the group; may additionally appoint and dismiss moderators.
+    Owner,
+}
+
+impl From<chat::GroupRole> for JsonrpcGroupRole {
+    fn from(role: chat::GroupRole) -> Self {
+        match role {
+            chat::GroupRole::Member => JsonrpcGroupRole::Member,
+            chat::GroupRole::Moderator => JsonrpcGroupRole::Moderator,
+            chat::GroupRole::Owner => JsonrpcGroupRole::Owner,
+        }
+    }
+}
+
+/// Roles and permissions of the current user in a group.
+///
+/// For groups without an owner (`is_managed == false`)
+/// everybody may modify the member list, as before.
+#[derive(Serialize, TypeDef, schemars::JsonSchema)]
+#[serde(rename = "GroupRoles", rename_all = "camelCase")]
+pub struct JsonrpcGroupRoles {
+    /// True if the group has an owner,
+    /// i.e. membership changes require authorization.
+    pub is_managed: bool,
+    /// Role of the current user.
+    pub self_role: JsonrpcGroupRole,
+    /// Role of each current member, keyed by contact ID.
+    pub roles: HashMap<u32, JsonrpcGroupRole>,
+    /// True if the current user may add members
+    /// (this also applies to showing the invite QR code).
+    pub can_add_members: bool,
+    /// Contact IDs of the members the current user may remove
+    /// (excluding the current user, who may always leave).
+    pub removable_contact_ids: Vec<u32>,
+}
+
+impl JsonrpcGroupRoles {
+    pub async fn try_from_dc_chat_id(context: &Context, chat_id: u32) -> Result<Self> {
+        let chat_id = ChatId::new(chat_id);
+        let is_managed = chat::is_managed_group(context, chat_id).await?;
+        let self_role = chat::get_group_role(context, chat_id, ContactId::SELF).await?;
+        let stored = chat::get_group_roles(context, chat_id).await?;
+
+        let mut removable_contact_ids = Vec::new();
+        for (contact_id, _) in &stored {
+            if *contact_id != ContactId::SELF
+                && chat::may_change_membership(context, chat_id, ContactId::SELF, *contact_id, false)
+                    .await?
+            {
+                removable_contact_ids.push(contact_id.to_u32());
+            }
+        }
+
+        Ok(Self {
+            is_managed,
+            self_role: self_role.into(),
+            roles: stored
+                .into_iter()
+                .map(|(id, role)| (id.to_u32(), role.into()))
+                .collect(),
+            can_add_members: !is_managed || self_role != chat::GroupRole::Member,
+            removable_contact_ids,
+        })
     }
 }

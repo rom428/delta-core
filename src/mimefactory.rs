@@ -1469,6 +1469,13 @@ impl MimeFactory {
                     "Chat-Group-ID",
                     mail_builder::headers::raw::Raw::new(chat.grpid.clone()).into(),
                 ));
+                // Owner and moderators of a managed group.
+                if let Some(roles) = crate::chat::render_group_roles(context, chat.id).await? {
+                    headers.push((
+                        "Chat-Group-Roles",
+                        mail_builder::headers::raw::Raw::new(roles).into(),
+                    ));
+                }
             }
         }
 

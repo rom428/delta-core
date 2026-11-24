@@ -3742,6 +3742,296 @@ pub(crate) async fn update_chat_contacts_table(
     Ok(())
 }
 
+/// Role of a contact in a managed group.
+///
+/// Groups created with [`create_managed_group`] have exactly one owner.
+/// Only the owner may change moderators; the owner and moderators may add and remove members.
+/// A moderator cannot remove the owner or other moderators.
+/// Groups without an owner are unmanaged and keep the classic behaviour
+/// where every member may modify the member list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GroupRole {
+    /// Regular member.
+    Member = 0,
+    /// May add and remove regular members.
+    Moderator = 1,
+    /// Created the group, may additionally appoint and dismiss moderators.
+    Owner = 2,
+}
+
+impl GroupRole {
+    pub(crate) fn from_i32(v: i32) -> Self {
+        match v {
+            2 => GroupRole::Owner,
+            1 => GroupRole::Moderator,
+            _ => GroupRole::Member,
+        }
+    }
+}
+
+/// Returns the role of `contact_id` in the chat.
+pub async fn get_group_role(
+    context: &Context,
+    chat_id: ChatId,
+    contact_id: ContactId,
+) -> Result<GroupRole> {
+    let role: Option<i32> = context
+        .sql
+        .query_get_value(
+            "SELECT role FROM chats_contacts WHERE chat_id=? AND contact_id=?",
+            (chat_id, contact_id),
+        )
+        .await?;
+    Ok(GroupRole::from_i32(role.unwrap_or_default()))
+}
+
+/// Returns true if the group has an owner, i.e. membership changes require authorization.
+pub async fn is_managed_group(context: &Context, chat_id: ChatId) -> Result<bool> {
+    context
+        .sql
+        .exists(
+            "SELECT COUNT(*) FROM chats_contacts WHERE chat_id=? AND role=?",
+            (chat_id, GroupRole::Owner as i32),
+        )
+        .await
+}
+
+/// Checks whether `actor` may add (`adding == true`) or remove `target`
+/// in the managed group `chat_id`.
+///
+/// Unmanaged groups allow everything, as before.
+pub async fn may_change_membership(
+    context: &Context,
+    chat_id: ChatId,
+    actor: ContactId,
+    target: ContactId,
+    adding: bool,
+) -> Result<bool> {
+    if !is_managed_group(context, chat_id).await? {
+        return Ok(true);
+    }
+    let actor_role = get_group_role(context, chat_id, actor).await?;
+    match actor_role {
+        GroupRole::Owner => Ok(target != actor || !adding),
+        GroupRole::Moderator => {
+            if adding {
+                return Ok(true);
+            }
+            // A moderator may remove regular members or leave, but not remove owner or other moderators.
+            if target == actor {
+                return Ok(true);
+            }
+            Ok(get_group_role(context, chat_id, target).await? == GroupRole::Member)
+        }
+        // Regular members may only leave on their own.
+        GroupRole::Member => Ok(!adding && target == actor),
+    }
+}
+
+/// Returns the stored role of every member row of the chat.
+///
+/// Contacts that are no longer members are not included.
+pub async fn get_group_roles(
+    context: &Context,
+    chat_id: ChatId,
+) -> Result<Vec<(ContactId, GroupRole)>> {
+    let rows: Vec<(ContactId, i32)> = context
+        .sql
+        .query_map_vec(
+            "SELECT contact_id, role FROM chats_contacts WHERE chat_id=? AND add_timestamp >= remove_timestamp",
+            (chat_id,),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, role)| (id, GroupRole::from_i32(role)))
+        .collect())
+}
+
+/// Sets the role of a contact in the chat without any authorization check.
+pub(crate) async fn set_group_role_in_db(
+    context: &Context,
+    chat_id: ChatId,
+    contact_id: ContactId,
+    role: GroupRole,
+) -> Result<()> {
+    context
+        .sql
+        .execute(
+            "UPDATE chats_contacts SET role=? WHERE chat_id=? AND contact_id=?",
+            (role as i32, chat_id, contact_id),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Returns the fingerprint of a key-contact, including self.
+pub(crate) async fn contact_fingerprint_hex(
+    context: &Context,
+    contact_id: ContactId,
+) -> Result<Option<String>> {
+    use crate::key::DcKey;
+
+    if contact_id == ContactId::SELF {
+        let key = crate::key::load_self_public_key(context).await?;
+        return Ok(Some(key.dc_fingerprint().hex()));
+    }
+    Ok(Contact::get_by_id(context, contact_id)
+        .await?
+        .fingerprint()
+        .map(|f| f.hex()))
+}
+
+/// Renders the value of the `Chat-Group-Roles` header: `<fingerprint>:<role>` pairs
+/// for the owner and all moderators, or `None` for unmanaged groups.
+pub(crate) async fn render_group_roles(
+    context: &Context,
+    chat_id: ChatId,
+) -> Result<Option<String>> {
+    let rows: Vec<(ContactId, i32)> = context
+        .sql
+        .query_map_vec(
+            "SELECT contact_id, role FROM chats_contacts WHERE chat_id=? AND role>0",
+            (chat_id,),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .await?;
+    let mut parts = Vec::new();
+    for (contact_id, role) in rows {
+        if let Some(fpr) = contact_fingerprint_hex(context, contact_id).await? {
+            parts.push(format!("{fpr}:{role}"));
+        }
+    }
+    if parts.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(parts.join(" ")))
+    }
+}
+
+/// Creates a new managed group. The creator becomes its owner.
+///
+/// Only the owner can appoint moderators with [`set_group_moderator`].
+/// Only the owner and moderators can add or remove members.
+pub async fn create_managed_group(context: &Context, name: &str) -> Result<ChatId> {
+    let owner_fpr = contact_fingerprint_hex(context, ContactId::SELF)
+        .await?
+        .context("Cannot create a managed group without an own key")?;
+    // The group ID commits to the owner, so that nobody else can claim ownership later.
+    let grpid = create_managed_grpid(&owner_fpr);
+    let chat_id = create_group_ext(context, Sync, grpid, name).await?;
+    set_group_role_in_db(context, chat_id, ContactId::SELF, GroupRole::Owner).await?;
+    Ok(chat_id)
+}
+
+/// Length of the random part of a managed group ID, in base64 characters (6 bytes).
+const MANAGED_GRPID_NONCE_LEN: usize = 8;
+/// Length of the owner commitment in a managed group ID, in base64 characters (12 bytes).
+const MANAGED_GRPID_TAG_LEN: usize = 16;
+
+/// Computes the commitment to the owner that is stored in the second part of a managed group ID.
+fn managed_grpid_tag(nonce: &str, owner_fpr_hex: &str) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"dc-managed-group-owner-v1:");
+    hasher.update(nonce.as_bytes());
+    hasher.update(b":");
+    hasher.update(owner_fpr_hex.to_ascii_uppercase().as_bytes());
+    let digest = hasher.finalize();
+    base64::engine::general_purpose::URL_SAFE.encode(&digest[..12])
+}
+
+/// Creates a group ID that commits to the given owner.
+///
+/// The ID has the same length and alphabet as IDs created by `create_id()`:
+/// 8 random characters followed by 16 characters of SHA-256 over the random part and the
+/// owner's fingerprint. Members can thus check that a claimed owner is the group's creator,
+/// and nobody else can claim ownership without finding a key whose fingerprint matches.
+pub(crate) fn create_managed_grpid(owner_fpr_hex: &str) -> String {
+    use base64::Engine as _;
+
+    let mut nonce = [0u8; 6];
+    rand::fill(&mut nonce[..]);
+    let nonce = base64::engine::general_purpose::URL_SAFE.encode(nonce);
+    let tag = managed_grpid_tag(&nonce, owner_fpr_hex);
+    format!("{nonce}{tag}")
+}
+
+/// Returns true if the group ID commits to the owner with the given fingerprint.
+pub(crate) fn grpid_commits_to_owner(grpid: &str, owner_fpr_hex: &str) -> bool {
+    if !grpid.is_ascii() || grpid.len() != MANAGED_GRPID_NONCE_LEN + MANAGED_GRPID_TAG_LEN {
+        return false;
+    }
+    let (nonce, tag) = grpid.split_at(MANAGED_GRPID_NONCE_LEN);
+    managed_grpid_tag(nonce, owner_fpr_hex) == tag
+}
+
+/// Appoints or dismisses a moderator. Only the group owner may do this.
+///
+/// The new role is propagated to other members
+/// with the `Chat-Group-Roles` header of a message sent to the group.
+pub async fn set_group_moderator(
+    context: &Context,
+    chat_id: ChatId,
+    contact_id: ContactId,
+    is_moderator: bool,
+) -> Result<()> {
+    ensure!(!chat_id.is_special(), "bad chat_id: {chat_id}");
+    let chat = Chat::load_from_db(context, chat_id).await?;
+    ensure!(chat.typ == Chattype::Group, "Roles exist only in groups");
+    ensure!(
+        get_group_role(context, chat_id, ContactId::SELF).await? == GroupRole::Owner,
+        "Only the group owner can change moderators"
+    );
+    ensure!(
+        contact_id != ContactId::SELF,
+        "Owner role cannot be changed"
+    );
+    ensure!(
+        is_contact_in_chat(context, chat_id, contact_id).await?,
+        "Contact is not a member of the group"
+    );
+    let role = if is_moderator {
+        GroupRole::Moderator
+    } else {
+        GroupRole::Member
+    };
+    set_group_role_in_db(context, chat_id, contact_id, role).await?;
+
+    send_group_roles_notice(context, chat_id).await?;
+    context.emit_event(EventType::ChatModified(chat_id));
+    Ok(())
+}
+
+/// Sends a plain notice to the group if it was already sent to other members.
+///
+/// The roles header is attached to every outgoing group message,
+/// so the notice only serves to carry the current roles to the other members.
+pub(crate) async fn send_group_roles_notice(context: &Context, chat_id: ChatId) -> Result<()> {
+    let chat = Chat::load_from_db(context, chat_id).await?;
+    if chat.is_promoted() {
+        let mut msg = Message::new_text("Group roles changed.".to_string());
+        msg.id = send_msg(context, chat_id, &mut msg).await?;
+        context.emit_msgs_changed(chat_id, msg.id);
+    }
+    Ok(())
+}
+
+/// Returns true if the group has at least one moderator.
+pub(crate) async fn has_group_moderators(context: &Context, chat_id: ChatId) -> Result<bool> {
+    context
+        .sql
+        .exists(
+            "SELECT COUNT(*) FROM chats_contacts
+             WHERE chat_id=? AND role=? AND add_timestamp >= remove_timestamp",
+            (chat_id, GroupRole::Moderator as i32),
+        )
+        .await
+}
+
 /// Adds contacts to the `chats_contacts` table.
 pub(crate) async fn add_to_chat_contacts_table(
     context: &Context,
@@ -3875,6 +4165,15 @@ pub(crate) async fn add_contact_to_chat_ext(
             "Can not add contact because the account is not part of the group/broadcast."
         );
         return Ok(false);
+    }
+    if chat.typ == Chattype::Group
+        && !may_change_membership(context, chat_id, ContactId::SELF, contact_id, true).await?
+    {
+        warn!(
+            context,
+            "Not allowed to add contact {contact_id} to managed group {chat_id}."
+        );
+        bail!("Only the owner or a moderator can add members to this group");
     }
     if from_handshake && chat.param.get_int(Param::Unpromoted).unwrap_or_default() == 1 {
         let now = time();
@@ -4138,6 +4437,10 @@ pub async fn remove_contact_from_chat(
         context.emit_event(EventType::ErrorSelfNotInGroup(err_msg.clone()));
         bail!("{err_msg}");
     }
+    ensure!(
+        may_change_membership(context, chat_id, ContactId::SELF, contact_id, false).await?,
+        "Not allowed to remove contact {contact_id} from managed group {chat_id}"
+    );
 
     let mut sync = Nosync;
 
